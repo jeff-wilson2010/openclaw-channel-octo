@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.14] - 2026-06-05
+
+### Fixed
+- **自建 Docker+MinIO 部署下 bot 所有图片/文件/视频消息上传 100% 失败**（YUJ-3268）：adapter 之前硬编码走 COS-only 的 `GET /v1/bot/upload/credentials`（返回腾讯云 COS STS 密钥，`cos-nodejs-sdk-v5` 无 endpoint 选项默认打 `*.myqcloud.com`）。无 COS 配置的部署取凭证直接 500。改为统一走 server 早已提供的后端无关预签名链路（MinIO/COS/S3/OSS 全可用），与 web/iOS/Android 三端一致。
+  - `getUploadCredentials` → `getUploadPresign`：调 `GET /v1/bot/upload/presigned?filename=&fileSize=&contentType=`，拿 `uploadUrl / downloadUrl / contentType / contentDisposition`
+  - `uploadFileToCOS` → `uploadFileToPresignedUrl`：对 `uploadUrl` 发单次 PUT（原生 `fetch`），原样回放 server 返回的 `Content-Type` 与 `Content-Disposition`（两者均签进 SigV4 canonical headers，不回放即 403），并显式带签名一致的 `Content-Length`
+  - attachment 引用改用返回的 `downloadUrl`
+  - 删除 `cos-nodejs-sdk-v5` 依赖与全部 COS 构造代码
+
+### Internal
+- presigned 路由 `fileSize` 必填正整数且会签进 Content-Length（SigV4 严格校验），上传前先落 temp 用真实 `statSync().size` 当 fileSize，去掉对 HEAD `Content-Length` 的信任（同时修掉 P1-2 大小预检绕过）
+- 上传上限 500MB → 100MB，对齐 server `file.MaxFileSize`
+- `inbound.ts` / `actions.ts` 等处 "COS / MinIO" 注释/命名改为与后端无关实现一致（消解 P1-1）
+
 ## [1.0.13] - 2026-05-27
 
 ### Fixed
