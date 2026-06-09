@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.15...v1.1.0) (2026-06-09)
+
+
+### Added
+
+* **agent-tools:** add write-secret action with internal deref ([#71](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/71)) ([5d73979](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/5d739790e4c082a5b07177910dc55f65fbeb4960))
+
+
+### Fixed
+
+* **inbound:** bound dispatch + apology + final flush against silent hangs (Refs [#75](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/75)) ([#83](https://github.com/Mininglamp-OSS/openclaw-channel-octo/issues/83)) ([0a4f702](https://github.com/Mininglamp-OSS/openclaw-channel-octo/commit/0a4f702995960bcaf88f64ed9b8b8f4bfa314ee2))
+
 ## [1.0.15](https://github.com/Mininglamp-OSS/openclaw-channel-octo/compare/v1.0.14...v1.0.15) (2026-06-08)
 
 ### Fixed
