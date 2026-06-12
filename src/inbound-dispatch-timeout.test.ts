@@ -1,5 +1,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ChannelType, MessageType } from "./types.js";
+
+// Make the tool-warning classifier recognize a test-flagged payload
+// (`__toolWarning: true`). Behavior-preserving for every other test in this
+// file: un-flagged payloads still classify as non-warning (the real classifier
+// reads an internal WeakMap that tests cannot populate), so only the dedicated
+// ghost-suppression test below is affected. resolveSendableOutboundReplyParts
+// (also consumed by inbound.ts) is preserved via importOriginal.
+vi.mock("openclaw/plugin-sdk/reply-payload", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/reply-payload")>();
+  return {
+    ...actual,
+    isReplyPayloadNonTerminalToolErrorWarning: (payload: any) => payload?.__toolWarning === true,
+  };
+});
+
 import {
   handleInboundMessage,
   _setDispatchTimeoutForTests,
@@ -676,5 +691,63 @@ describe("dispatch idle timeout (issue #113)", () => {
       const cleared = clearTimeoutSpy.mock.calls.some((call: any[]) => call[0] === handle);
       expect(cleared, `idle-timer handle from setTimeout call ${c.idx} leaked (not cleared)`).toBe(true);
     }
+  });
+
+  it("ghost suppression: a woken timed-out dispatch's onFreshSettledDelivery does NOT post a tool warning", async () => {
+    // Fix #1. The timed-out dispatch is NOT cancelled. Before the idle timeout
+    // fires it defers a tool-warning final (pendingToolWarningFinal set). When
+    // the dispatch later "wakes" and settles, its internal finally fires
+    // onFreshSettledDelivery — which, without the fix, would post the tool
+    // warning AFTER the "处理超时" apology (a ghost message). The timeout catch
+    // now clears pendingToolWarningFinal and sets deliveryErrorOccurred, so the
+    // existing onFreshSettledDelivery guard drops it.
+    _setDispatchTimeoutForTests(IDLE_WINDOW_MS);
+
+    let capturedOnSettled: (() => Promise<any>) | undefined;
+    const dispatch = vi.fn(async (args: any) => {
+      // Defer a tool-warning final → sets pendingToolWarningFinal.
+      await args.dispatcherOptions.deliver(
+        { text: "write_file failed", isError: true, __toolWarning: true },
+        { kind: "final" },
+      );
+      capturedOnSettled = args.dispatcherOptions.onFreshSettledDelivery;
+      await new Promise<void>(() => {}); // never resolves → idle timeout fires
+    });
+    setOctoRuntime({
+      config: { loadConfig: () => ({}) },
+      channel: {
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: dispatch,
+          resolveEnvelopeFormatOptions: () => ({}),
+          formatAgentEnvelope: ({ body }: any) => body,
+          finalizeInboundContext: (ctx: any) => ctx,
+        },
+        routing: {
+          resolveAgentRoute: () => ({ agentId: "agent1", sessionKey: "sk1", accountId: "acct1" }),
+        },
+        session: {
+          resolveStorePath: () => "/tmp/store",
+          readSessionUpdatedAt: () => undefined,
+          recordInboundSession: async () => {},
+        },
+      },
+    } as any);
+    const { sends } = installFetchStub();
+
+    await expect(runInbound({ log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } }))
+      .rejects.toThrow();
+
+    // The timeout apology was posted exactly once.
+    expect(pickTimeoutSends(sends)).toHaveLength(1);
+    // The deferred warning must NOT have been sent before the timeout either.
+    expect(sends.filter((s) => s?.payload?.content === "write_file failed")).toHaveLength(0);
+
+    // Now the still-running dispatch wakes and settles → triggers the callback.
+    expect(capturedOnSettled).toBeDefined();
+    const result = await capturedOnSettled!();
+    expect(result, "onFreshSettledDelivery must short-circuit after a timeout").toBeUndefined();
+
+    // No ghost tool warning reached sendMessage — only the apology did.
+    expect(sends.filter((s) => s?.payload?.content === "write_file failed")).toHaveLength(0);
   });
 });

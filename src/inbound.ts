@@ -1,6 +1,25 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import type { ChannelLogSink } from "openclaw/plugin-sdk/channel-contract";
+import type { ReplyPayload, ReplyDispatchKind } from "openclaw/plugin-sdk/reply-runtime";
+import type { ReplyDispatcherWithTypingOptions } from "openclaw/plugin-sdk/reply-runtime";
 import { DEFAULT_GROUP_HISTORY_LIMIT } from "openclaw/plugin-sdk/reply-history";
+// Namespace import + runtime feature detection so the deliver-buffer fix
+// degrades gracefully across SDK versions:
+//   - isReplyPayloadNonTerminalToolErrorWarning lands in newer SDK (>=5.27);
+//     on older SDK (e.g. 5.22) it is undefined, so we cannot classify a final
+//     as a tool-warning fallback and treat it as a normal final (sent
+//     immediately), which still preserves the real user-facing reply.
+//   - resolveSendableOutboundReplyParts is present across these versions.
+import * as replyPayloadSdk from "openclaw/plugin-sdk/reply-payload";
+
+const replyPayloadCompat = replyPayloadSdk as typeof replyPayloadSdk & {
+  isReplyPayloadNonTerminalToolErrorWarning?: (payload: ReplyPayload) => boolean;
+};
+const isReplyPayloadNonTerminalToolErrorWarning =
+  typeof replyPayloadCompat.isReplyPayloadNonTerminalToolErrorWarning === "function"
+    ? replyPayloadCompat.isReplyPayloadNonTerminalToolErrorWarning
+    : undefined;
+const resolveSendableOutboundReplyParts = replyPayloadSdk.resolveSendableOutboundReplyParts;
 import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, postJson, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl, fetchUserInfo } from "./api-fetch.js";
 import { getMentionPrefFromCache, invalidateMentionPref } from "./mention-prefs.js";
 import { normalizeAccountId } from "./account-id.js";
@@ -148,6 +167,22 @@ function resolveOutboundMediaUrls(payload: { mediaUrl?: string; mediaUrls?: stri
     ...(payload.mediaUrls ?? []),
     ...(payload.mediaUrl ? [payload.mediaUrl] : []),
   ].filter(Boolean);
+}
+
+// Tool warning final: a kind=final payload that carries a non-terminal tool
+// error warning and no media.  These should be deferred (not sent immediately)
+// so they don't overwrite the real user-facing answer in the single-slot
+// deliver buffer.  Mirrors Discord's isFallbackOnlyToolWarningFinal.
+function isFallbackOnlyToolWarningFinal(payload: ReplyPayload): boolean {
+  // Older SDK lacks the tool-warning classifier: never defer, so the final is
+  // sent immediately and the real reply is never lost.
+  if (!isReplyPayloadNonTerminalToolErrorWarning) {
+    return false;
+  }
+  if (payload.isError !== true || !isReplyPayloadNonTerminalToolErrorWarning(payload)) {
+    return false;
+  }
+  return !resolveSendableOutboundReplyParts(payload).hasMedia;
 }
 
 /**
@@ -2380,6 +2415,9 @@ export async function handleInboundMessage(params: {
     textSent: false,
   };
   const sentMediaUrls = new Set<string>();
+  let userFacingFinalDelivered = false;
+  let pendingToolWarningFinal: { text: string } | undefined;
+  let deliveryErrorOccurred = false;
 
   // --- Shared helper: resolve mentions and send text ---
   const resolveAndSendText = async (content: string, signal?: AbortSignal): Promise<SendMessageResult | undefined> => {
@@ -2578,14 +2616,12 @@ export async function handleInboundMessage(params: {
       ctx: ctxPayload,
       cfg: config,
       replyOptions: {},
-      dispatcherOptions: {
-        deliver: async (payload: {
-          text?: string;
-          mediaUrls?: string[];
-          mediaUrl?: string;
-          replyToId?: string | null;
-          isReasoning?: boolean;
-        }, info?: { kind?: string }) => {
+      // onFreshSettledDelivery is only present on newer SDK dispatcher options.
+      // On older SDK the property is ignored (and never invoked, since
+      // pendingToolWarningFinal is only set when the tool-warning classifier
+      // exists), so the cast keeps both versions type-correct.
+      dispatcherOptions: ({
+        deliver: async (payload: ReplyPayload, info: { kind: ReplyDispatchKind }) => {
           // Any deliver event — including reasoning-only blocks — proves the
           // dispatcher is alive, so reset the idle timer FIRST. This MUST run
           // before the `if (payload.isReasoning) return;` below: a turn that
@@ -2596,7 +2632,7 @@ export async function handleInboundMessage(params: {
           // Skip reasoning blocks
           if (payload.isReasoning) return;
 
-          const kind = info?.kind ?? "final";
+          const kind = info.kind;
 
           // --- Media: send immediately (no edit/forward issue) with dedup ---
           const outboundMediaUrls = resolveOutboundMediaUrls(payload);
@@ -2629,13 +2665,54 @@ export async function handleInboundMessage(params: {
 
           if (kind === "tool") {
             // Verbose tool call output: send immediately
-            await resolveAndSendText(content);
+            await resolveAndSendText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
             replySucceeded = true;
             log?.info?.(`octo: [deliver] tool text sent (${content.length} chars)`);
             return;
           }
 
-          // kind === "block" / "final" / anything else: buffer, send only once after dispatcher finishes
+          if (kind === "final") {
+            if (isFallbackOnlyToolWarningFinal(payload)) {
+              if (!userFacingFinalDelivered) {
+                pendingToolWarningFinal = { text: content };
+              }
+              log?.debug?.(
+                `octo: [deliver-buffer] tool warning final deferred (${content.length} chars)`,
+              );
+              return;
+            }
+
+            // Idempotency: at most one user-facing normal final per turn. The
+            // old single-slot buffer flushed exactly once; if upstream emits
+            // multiple normal finals in a turn, keep the first and drop the
+            // rest so the user never sees duplicate answers.
+            if (userFacingFinalDelivered) {
+              log?.debug?.(`octo: [deliver] duplicate final ignored (${content.length} chars)`);
+              return;
+            }
+
+            // Mark delivered + suppress the buffer/pending fallback BEFORE the
+            // await so a final racing in mid-send (or the pending tool-warning
+            // fallback) can't double-send.
+            userFacingFinalDelivered = true;
+            pendingToolWarningFinal = undefined;
+            deliverBuffer.lastText = null;
+            deliverBuffer.textSent = true;
+            // Wrap the send so a failure is logged but does NOT bubble out of
+            // deliver — mirrors the old finally-flush, which swallowed send
+            // errors and only logged them (avoids a new regression where a
+            // failed final POST rejects the whole dispatch).
+            try {
+              await resolveAndSendText(content, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+              replySucceeded = true;
+              log?.info?.(`octo: [deliver] final text sent immediately (${content.length} chars)`);
+            } catch (finalSendErr) {
+              log?.error?.(`octo: [deliver] final text send failed: ${String(finalSendErr)}`);
+            }
+            return;
+          }
+
+          // kind === "block" / anything else: buffer, send only once after dispatcher finishes
           deliverBuffer.lastText = content;
           log?.debug?.(`octo: [deliver-buffer] ${kind} text buffered (${content.length} chars)`);
         },
@@ -2645,6 +2722,7 @@ export async function handleInboundMessage(params: {
           // Prevent finally block from sending stale buffered text after error
           deliverBuffer.lastText = null;
           deliverBuffer.textSent = true;
+          deliveryErrorOccurred = true;
           try {
             await sendMessage({
               apiUrl,
@@ -2663,7 +2741,35 @@ export async function handleInboundMessage(params: {
             log?.error?.(`octo: failed to send error message: ${String(sendErr)}`);
           }
         },
-      },
+        onFreshSettledDelivery: async () => {
+          if (!pendingToolWarningFinal || userFacingFinalDelivered || deliveryErrorOccurred) {
+            return undefined;
+          }
+          // Buffered block text is the real user-facing reply; let the finally
+          // flush deliver it and drop the warning fallback (single message).
+          if (deliverBuffer.lastText && !deliverBuffer.textSent) {
+            pendingToolWarningFinal = undefined;
+            return undefined;
+          }
+          const pending = pendingToolWarningFinal;
+          pendingToolWarningFinal = undefined;
+          try {
+            await resolveAndSendText(pending.text, AbortSignal.timeout(DISPATCH_TIMEOUT_APOLOGY_MS));
+            replySucceeded = true;
+            log?.info?.(
+              `octo: [deliver] pending tool warning sent as fallback (${pending.text.length} chars)`,
+            );
+            return { visibleReplySent: true };
+          } catch (err) {
+            log?.error?.(
+              `octo: [deliver] tool warning fallback send failed: ${String(err)}`,
+            );
+            return { visibleReplySent: false };
+          }
+        },
+      } as ReplyDispatcherWithTypingOptions & {
+        onFreshSettledDelivery?: () => Promise<{ visibleReplySent: boolean } | undefined>;
+      }),
       }),
       dispatchTimeoutPromise,
     ]);
@@ -2684,6 +2790,17 @@ export async function handleInboundMessage(params: {
       );
       deliverBuffer.lastText = null;
       deliverBuffer.textSent = true;
+      // Ghost-suppression (issue #113 review): the timed-out dispatch is NOT
+      // cancelled. If it later wakes and settles normally, its internal finally
+      // fires onFreshSettledDelivery — and with a still-pending tool warning
+      // (userFacingFinalDelivered=false, deliveryErrorOccurred=false) it would
+      // post a tool warning AFTER the "⚠️ 处理超时" apology (a ghost message).
+      // Clear the pending warning AND set deliveryErrorOccurred so the existing
+      // onFreshSettledDelivery guard (`!pendingToolWarningFinal ||
+      // userFacingFinalDelivered || deliveryErrorOccurred`) drops it. Symmetric
+      // with the deliverBuffer suppression just above.
+      pendingToolWarningFinal = undefined;
+      deliveryErrorOccurred = true;
       try {
         // The apology call itself MUST be bounded — otherwise a sick Octo API
         // hangs this sendMessage too, defeating the whole timeout fix. See
@@ -2710,7 +2827,7 @@ export async function handleInboundMessage(params: {
     settled = true;
     if (dispatchTimeoutHandle) clearTimeout(dispatchTimeoutHandle);
     // --- Debug: log dispatch outcome ---
-    log?.debug?.(`octo: [dispatch-result] replySucceeded=${replySucceeded} bufferedText=${deliverBuffer.lastText?.length ?? 0} textSent=${deliverBuffer.textSent} effectiveOBO=${effectiveOnBehalfOf ?? 'none'}`);
+    log?.debug?.(`octo: [dispatch-result] replySucceeded=${replySucceeded} bufferedText=${deliverBuffer.lastText?.length ?? 0} textSent=${deliverBuffer.textSent} userFacingFinalDelivered=${userFacingFinalDelivered} effectiveOBO=${effectiveOnBehalfOf ?? 'none'}`);
 
     // --- Final send: deliver buffered text if only blocks arrived (no final/tool) ---
     if (deliverBuffer.lastText && !deliverBuffer.textSent) {
